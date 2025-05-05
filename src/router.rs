@@ -24,4 +24,26 @@ impl Router {
             layers: Vec::new(),
         }
     }
+
+    pub fn route<F, Fut>(mut self, path: &str, method: Method, handler: F) -> Self
+    where
+        F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
+        Fut:
+            std::future::Future<Output = Result<Response<Incoming>, hyper::Error>> + Send + 'static,
+    {
+        let handler =
+            Arc::new(move |req: Request<Incoming>| -> BoxFuture<_> { Box::pin(handler(req)) })
+                as Handler;
+
+        let mut final_handler = handler;
+
+        for layer in self.layers.iter().rev() {
+            final_handler = layer(final_handler.clone());
+        }
+
+        self.routes
+            .insert((method, path.to_string()), final_handler);
+
+        self
+    }
 }
