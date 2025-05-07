@@ -1,36 +1,38 @@
-use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::io::Write;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use oxide::responses::HttpResponse;
+use oxide::router::{handle_connection, Router};
 
-async fn hello(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(Response::new(Full::new(Bytes::from("Hello, World!"))))
+pub fn hello_world(mut stream: TcpStream) {
+    stream
+        .write_all(HttpResponse::ok_plaintext("Hello world!!").as_bytes())
+        .unwrap();
+}
+
+pub fn index(mut stream: TcpStream) {
+    stream
+        .write_all(HttpResponse::ok_plaintext("Pagina principal").as_bytes())
+        .unwrap();
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> std::io::Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let listener = TcpListener::bind(addr)?;
 
-    let listener = TcpListener::bind(addr).await?;
+    let router = Arc::new(Router::new().get("/", index).get("/hello", hello_world));
+
+    println!("Listening on http://127.0.0.1:3000");
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = listener.accept()?;
+        let router = Arc::clone(&router);
 
-        let io = TokioIo::new(stream);
-
+        // Spawn a new task for each connection
         tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service_fn(hello))
-                .await
-            {
-                eprintln!("Error serving connection: {:?}", err);
-            }
+            handle_connection(stream, router).await;
         });
     }
 }
