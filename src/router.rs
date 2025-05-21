@@ -1,14 +1,11 @@
-use std::{
-    collections::HashMap,
-    io::{Read, Write},
-    net::TcpStream,
-    str::from_utf8,
-    sync::Arc,
-};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
+
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 use crate::responses::HttpResponse;
 
-type Handler = Arc<dyn Fn(TcpStream) + Send + Sync>;
+type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type Handler = Arc<dyn Fn(TcpStream) -> BoxedFuture + Send + Sync>;
 
 #[derive(Eq, Hash, PartialEq)]
 pub enum Method {
@@ -30,6 +27,11 @@ impl Method {
     }
 }
 
+pub struct Route {
+    pub method: Method,
+    pub handler: Handler,
+}
+
 pub struct Router {
     routes: HashMap<(String, Method), Handler>,
 }
@@ -41,70 +43,80 @@ impl Router {
         }
     }
 
-    fn add_route<F>(mut self, method: Method, path: &str, handler: F) -> Self
-    where
-        F: Fn(TcpStream) + Send + Sync + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.routes.insert((path.to_string(), method), handler);
+    // fn add_route<F>(mut self, method: Method, path: &str, handler: F) -> Self
+    // where
+    //     F: Fn(TcpStream) + Send + Sync + 'static,
+    // {
+    //     let handler = Arc::new(handler);
+    //     self.routes.insert((path.to_string(), method), handler);
+    //     self
+    // }
+
+    pub fn route(mut self, path: &str, route: Route) -> Self {
+        self.routes
+            .insert((path.to_string(), route.method), route.handler);
         self
     }
 
-    pub fn get<F>(self, path: &str, handler: F) -> Self
-    where
-        F: Fn(TcpStream) + Send + Sync + 'static,
-    {
-        self.add_route(Method::GET, path, handler)
-    }
-
-    pub fn post<F>(self, path: &str, handler: F) -> Self
-    where
-        F: Fn(TcpStream) + Send + Sync + 'static,
-    {
-        self.add_route(Method::POST, path, handler)
-    }
-
-    pub fn put<F>(self, path: &str, handler: F) -> Self
-    where
-        F: Fn(TcpStream) + Send + Sync + 'static,
-    {
-        self.add_route(Method::PUT, path, handler)
-    }
-
-    pub fn delete<F>(self, path: &str, handler: F) -> Self
-    where
-        F: Fn(TcpStream) + Send + Sync + 'static,
-    {
-        self.add_route(Method::DELETE, path, handler)
-    }
-
-    pub fn handle(&self, req_path: &str, method: Method, mut stream: TcpStream) {
+    pub async fn handle(&self, req_path: &str, method: Method, mut stream: TcpStream) {
         if let Some(handler) = self.routes.get(&(req_path.to_string(), method)) {
-            handler(stream);
+            handler(stream).await;
         } else {
-            stream
-                .write_all(HttpResponse::not_found().as_bytes())
-                .unwrap();
+            let _ = async move {
+                stream
+                    .write_all(HttpResponse::not_found().as_bytes())
+                    .await
+                    .unwrap();
+            };
         }
     }
 }
 
 pub async fn handle_connection(mut stream: TcpStream, router: Arc<Router>) {
-    let mut buffer = [0; 1024];
-    let n = stream.read(&mut buffer).unwrap();
+    use std::str::from_utf8;
+    use tokio::io::AsyncReadExt;
 
-    let request = from_utf8(&buffer[..n]).unwrap();
+    let mut buffer = [0; 1024];
+    let n = stream.read(&mut buffer).await.unwrap();
+
+    let request = from_utf8(&buffer[..n]).unwrap_or("");
     println!("Request: {}", request);
 
     let mut split_request = request.split_whitespace();
-    let method = split_request.next().unwrap(); // GET, POST, etc.
-    let path = split_request.next().unwrap();
+    let method = split_request.next().unwrap_or("");
+    let path = split_request.next().unwrap_or("/");
 
     match Method::from_str(method) {
-        Some(m) => router.handle(path, m, stream),
-        None => stream
-            .write_all(HttpResponse::method_not_allowed().as_bytes())
-            .unwrap(),
+        Some(m) => router.handle(path, m, stream).await,
+        None => {
+            let _ = stream
+                .write_all(HttpResponse::method_not_allowed().as_bytes())
+                .await;
+        }
+    }
+}
+
+pub fn get<F, Fut>(handler: F) -> Route
+where
+    F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let wrapped = Arc::new(move |stream: TcpStream| Box::pin(handler(stream)) as BoxedFuture);
+    Route {
+        method: Method::GET,
+        handler: wrapped,
+    }
+}
+
+pub fn post<F, Fut>(handler: F) -> Route
+where
+    F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let wrapped = Arc::new(move |stream: TcpStream| Box::pin(handler(stream)) as BoxedFuture);
+    Route {
+        method: Method::POST,
+        handler: wrapped,
     }
 }
 
